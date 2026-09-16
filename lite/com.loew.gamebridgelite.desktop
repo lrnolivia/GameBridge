@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=GameBridge Lite
+Comment=Keep supported player-name settings consistent across game libraries
+Exec=gamebridge-lite
+Icon=com.loew.gamebridgelite
+Terminal=false
+Categories=Game;Utility;
+StartupNotify=true
