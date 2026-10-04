@@ -5,6 +5,12 @@ from __future__ import annotations
 import argparse
 import ctypes
 import hashlib
+import json
+import tempfile
+import uuid
+import stat
+import preferences
+from xml.sax.saxutils import escape as xml_escape
 import os
 import re
 import shutil
@@ -86,7 +92,7 @@ EXACT_IDENTITY_NAMES = {
 SKIP_DIRS = {
     "_DLSS5_Backup","_OptiScaler_MFG_Backups",
     "backup","backups","_backup","_backups",
-    "_CommonRedist","__Installer",".git",
+    "_CommonRedist","__Installer",".git",".gamebridge","GameBridge_Backups",
 }
 DOC_RE = re.compile(r"^(readme|changelog|changes|license|credits|nfo|install|instructions|release[_ -]?notes?)", re.I)
 KEY_RE = "|".join(re.escape(x) for x in sorted(IDENTITY_KEYS, key=len, reverse=True))
@@ -473,7 +479,7 @@ def encode_text(text: str, kind: str) -> bytes:
     if kind == "utf-16-be-bom":
         return b"\xfe\xff" + text.encode("utf-16-be")
     if kind == "cp1252":
-        return text.encode("cp1252", errors="replace")
+        return text.encode("cp1252", errors="strict")
     return text.encode("utf-8")
 
 
@@ -491,36 +497,58 @@ def should_skip(root: Path, path: Path) -> bool:
     return any(part.casefold() in skip_lower for part in parts[:-1])
 
 
+def validate_player_name(value: str) -> str:
+    if not isinstance(value,str) or not value.strip() or len(value)>128 or any(ord(c)<32 or ord(c)==127 for c in value):
+        raise Stop("Use a nonempty player name of at most 128 characters without control characters")
+    return value
+
+
 def normalize_text(path: Path, text: str, new_name: str) -> tuple[str, list[str]]:
-    updated = text
-    reasons: list[str] = []
-
+    validate_player_name(new_name)
+    reasons=[]
     if path.name.casefold() in EXACT_IDENTITY_NAMES:
-        old = updated.strip()
+        old=text.strip()
         if old and "\n" not in old and "\r" not in old and is_supported_source_value(old):
-            lead = updated[: len(updated) - len(updated.lstrip())]
-            tail = updated[len(updated.rstrip()):]
-            updated = lead + new_name + tail
-            reasons.append(f"player-name file: {old} → {new_name}")
-
-    def kv_repl(m: re.Match[str]) -> str:
-        old = m.group("value").strip()
-        if not is_supported_source_value(old):
-            return m.group(0)
-        reasons.append(f'{m.group("key")}={old} → {new_name}')
-        return m.group("prefix") + m.group("q") + new_name + m.group("q") + m.group("tail")
-
-    updated = NORMALIZE_KV_RE.sub(kv_repl, updated)
-
-    def xml_repl(m: re.Match[str]) -> str:
-        old = m.group("value").strip()
-        if not is_supported_source_value(old):
-            return m.group(0)
-        reasons.append(f'{m.group("key")}={old} → {new_name}')
-        return m.group("open") + new_name + m.group("close")
-
-    updated = NORMALIZE_XML_RE.sub(xml_repl, updated)
-    return updated, list(dict.fromkeys(reasons))
+            return text[:len(text)-len(text.lstrip())]+new_name+text[len(text.rstrip()):],["player-name file"]
+        return text,[]
+    if path.suffix.casefold()=='.json':
+        def unique(pairs):
+            result={}
+            for key,value in pairs:
+                if key in result:raise ValueError('Duplicate JSON key')
+                result[key]=value
+            return result
+        try:json.loads(text,object_pairs_hook=unique)
+        except (ValueError,TypeError):return text,[]
+        token=re.compile(r'(?P<key>"(?:[^"\\]|\\.)*")(?P<sep>\s*:\s*)(?P<value>"(?:[^"\\]|\\.)*")')
+        def json_value(match):
+            key=json.loads(match['key']);old=json.loads(match['value'])
+            if key.casefold() not in {x.casefold() for x in IDENTITY_KEYS} or not is_supported_source_value(old):return match[0]
+            reasons.append(key);return match['key']+match['sep']+json.dumps(new_name,ensure_ascii=False)
+        updated=token.sub(json_value,text)
+        json.loads(updated,object_pairs_hook=unique)
+        return updated,reasons
+    if path.suffix.casefold()=='.xml':
+        import xml.etree.ElementTree as ET
+        try:ET.fromstring(text)
+        except ET.ParseError:return text,[]
+        def xml_value(match):
+            import html
+            old=html.unescape(match['value'].strip())
+            if not is_supported_source_value(old):return match[0]
+            reasons.append(match['key']);return match['open']+xml_escape(new_name)+match['close']
+        updated=NORMALIZE_XML_RE.sub(xml_value,text)
+        try:ET.fromstring(updated)
+        except ET.ParseError:return text,[]
+        return updated,reasons
+    # Unknown structured grammars remain read-only. INI-like values only accept
+    # names that do not require guessing a particular parser's escape rules.
+    if path.suffix.casefold() not in {'.ini','.cfg','.conf','.txt'}:return text,[]
+    if any(c in new_name for c in (';','#','\\','"',"'")):return text,[]
+    def kv_value(match):
+        if not is_supported_source_value(match['value'].strip()):return match[0]
+        reasons.append(match['key']);return match['prefix']+match['q']+new_name+match['q']+match['tail']
+    return NORMALIZE_KV_RE.sub(kv_value,text),reasons
 
 
 @dataclass
@@ -626,7 +654,7 @@ def audit_library(root: Path, verbose: bool = True) -> list[GameAudit]:
                 if DOC_RE.match(path.name):
                     continue
                 try:
-                    if path.stat().st_size > MAX_TEXT_BYTES:
+                    if path.is_symlink() or path.stat().st_nlink!=1 or path.stat().st_size > MAX_TEXT_BYTES:
                         continue
                     files_checked += 1
                     text, _ = detect_text(path.read_bytes())
@@ -706,8 +734,7 @@ def print_audit(results: list[GameAudit], desired: Optional[str] = None) -> None
 def scan_library(root: Path, new_name: str, verbose: bool = True) -> list[Change]:
     if not root.is_dir():
         raise Stop(f"Games folder does not exist: {root}")
-    if not new_name.strip():
-        raise Stop("Name to use is empty")
+    validate_player_name(new_name)
 
     if verbose:
         heading("Scanning game library")
@@ -732,12 +759,13 @@ def scan_library(root: Path, new_name: str, verbose: bool = True) -> list[Change
             if DOC_RE.match(path.name):
                 continue
             try:
-                if path.stat().st_size > MAX_TEXT_BYTES:
+                if path.is_symlink() or path.stat().st_nlink!=1 or path.stat().st_size > MAX_TEXT_BYTES:
                     continue
                 candidate_count += 1
                 text, enc = detect_text(path.read_bytes())
                 updated, reasons = normalize_text(path, text, new_name)
                 if updated != text:
+                    encode_text(updated,enc)  # Refuse lossy legacy-encoding writes during Review.
                     changes.append(Change(game_name(root, path), path, text, updated, enc, reasons))
             except (OSError, UnicodeError):
                 continue
@@ -787,58 +815,118 @@ def default_backup_root() -> Path:
     else:
         docs = HOME / "Documents"
         base = docs / "GameBridge_Backups" if docs.exists() else HOME / "GameBridge_Backups"
-    return base / f"ALL_GAMES_{stamp}"
+    return base / f"ALL_GAMES_{stamp}_{uuid.uuid4().hex}"
+
+
+def _safe_file(root: Path, path: Path) -> Path:
+    root=root.absolute();path=path.absolute()
+    try:relative=path.relative_to(root)
+    except ValueError:raise Stop("File is outside the chosen game library") from None
+    for component in [root,*[root.joinpath(*relative.parts[:i]) for i in range(1,len(relative.parts)+1)]]:
+        if component.is_symlink() or getattr(component,"is_junction",lambda:False)():raise Stop("Linked game paths require explicit review of their real location")
+    if path.resolve().is_relative_to(root.resolve()) is False:raise Stop("File escaped the chosen game library")
+    info=path.stat()
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink!=1:raise Stop("Only regular, non-hardlinked configuration files are editable")
+    return path
+
+
+def _atomic_bytes(path: Path, data: bytes, mode: int=0o600) -> None:
+    fd,name=tempfile.mkstemp(prefix='.gamebridge-',dir=path.parent)
+    try:
+        with os.fdopen(fd,'wb') as stream:
+            os.chmod(name,mode);stream.write(data);stream.flush();os.fsync(stream.fileno())
+        os.replace(name,path)
+        if os.name!='nt':
+            directory=os.open(path.parent,os.O_RDONLY)
+            try:os.fsync(directory)
+            finally:os.close(directory)
+    finally:
+        if os.path.exists(name):os.unlink(name)
 
 
 def apply_changes(root: Path, changes: list[Change], new_name: str) -> tuple[int, int, Path]:
-    if not changes:
-        return (0, 0, default_backup_root())
-
-    backup_root = default_backup_root()
-    changed: list[Path] = []
-    failed: list[Path] = []
-
-    heading("Backup + apply")
-    kv("Backup", backup_root)
-    print()
-
+    validate_player_name(new_name)
+    root=root.absolute()
+    if not changes:return 0,0,default_backup_root()
+    # Preflight the complete reviewed plan before backing up or modifying files.
+    prepared=[];seen=set()
     for change in changes:
-        try:
-            rel = change.path.relative_to(root)
-            backup = backup_root / rel
-            backup.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(change.path, backup)
-            change.path.write_bytes(encode_text(change.updated_text, change.encoding))
-            changed.append(change.path)
-            print("  " + green("✓ ") + change.game + "  " + dim(str(rel)))
-        except OSError as exc:
-            failed.append(change.path)
-            warn(f"Could not update {change.path}: {exc}")
+        path=_safe_file(root,change.path)
+        if path in seen:raise Stop("A reviewed plan contains duplicate paths")
+        seen.add(path);original=encode_text(change.original_text,change.encoding);updated=encode_text(change.updated_text,change.encoding)
+        expected,_=normalize_text(path,change.original_text,new_name)
+        if expected!=change.updated_text or expected==change.original_text:raise Stop("Reviewed plan does not match a supported name-only update")
+        if path.read_bytes()!=original:raise Stop("PLAN_STALE: configuration changed after Review")
+        prepared.append((change,path,original,updated))
+    lock=root/'.gamebridge-name.lock'
+    try:fd=os.open(lock,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)
+    except FileExistsError:raise Stop("Another update or interrupted recovery owns this library; inspect its lock before continuing") from None
+    backup_root=default_backup_root();journal={'schema':1,'state':'preparing','root':str(root),'files':[]};verified=0;failed=0
+    try:
+        with os.fdopen(fd,'w') as stream:stream.write(str(os.getpid()));stream.flush();os.fsync(stream.fileno())
+        backup_root.mkdir(parents=True,exist_ok=False)
+        for change,path,original,updated in prepared:
+            _safe_file(root,path)
+            if path.read_bytes()!=original:raise Stop("PLAN_STALE: configuration changed before backup")
+            relative=path.relative_to(root);backup=backup_root/relative;backup.parent.mkdir(parents=True,exist_ok=True)
+            with backup.open('xb') as stream:stream.write(original);stream.flush();os.fsync(stream.fileno())
+            if backup.read_bytes()!=original:raise Stop("Backup verification failed")
+            journal['files'].append({'path':str(relative),'before_sha256':hashlib.sha256(original).hexdigest(),'after_sha256':hashlib.sha256(updated).hexdigest(),'state':'backed-up'})
+        journal['state']='applying';_atomic_bytes(backup_root/'manifest.json',json.dumps(journal,indent=2).encode())
+        for index,(change,path,original,updated) in enumerate(prepared):
+            _safe_file(root,path)
+            if path.read_bytes()!=original:raise Stop("PLAN_STALE: configuration changed before atomic publication")
+            _atomic_bytes(path,updated,stat.S_IMODE(path.stat().st_mode))
+            if path.read_bytes()!=updated:raise Stop("Exact post-write verification failed; preserve backup for recovery")
+            verified+=1;journal['files'][index]['state']='verified';_atomic_bytes(backup_root/'manifest.json',json.dumps(journal,indent=2).encode())
+        journal['state']='complete';_atomic_bytes(backup_root/'manifest.json',json.dumps(journal,indent=2).encode())
+    except (OSError,UnicodeError,Stop) as error:
+        failed=len(changes)-verified;journal['state']='interrupted';journal['error']=str(error)
+        if backup_root.is_dir():_atomic_bytes(backup_root/'manifest.json',json.dumps(journal,indent=2).encode())
+        raise Stop(f"Update stopped; preserve {backup_root} for recovery: {error}") from error
+    finally:
+        # A hard process interruption leaves the exclusive lock for recovery.
+        if lock.exists():lock.unlink()
+    return verified,failed,backup_root
 
-    heading("Verification")
-    verified: list[Path] = []
-    for path in changed:
-        try:
-            text, _ = detect_text(path.read_bytes())
-            if new_name.casefold() in text.casefold():
-                verified.append(path)
-            else:
-                failed.append(path)
-                warn(f"Verification failed: {path}")
-        except (OSError, UnicodeError):
-            failed.append(path)
-            warn(f"Verification failed: {path}")
 
-    print()
-    if not failed:
-        ok("Player-name update complete")
-    else:
-        warn("Update completed with warnings")
-    kv("Configs changed", len(changed))
-    kv("Configs verified", len(verified))
-    kv("Verification failures", len(set(failed)))
-    kv("Backup", backup_root)
-    return (len(verified), len(set(failed)), backup_root)
+def restore_changes(root: Path, backup_root: Path) -> int:
+    """Restore verified config backups only while the applied preimage still matches."""
+    root=root.absolute();backup_root=backup_root.absolute()
+    journal_path=_safe_file(backup_root,backup_root/'manifest.json')
+    journal=json.loads(journal_path.read_text())
+    if journal.get('schema')!=1 or journal.get('root')!=str(root):raise Stop('Backup belongs to a different library or version')
+    plans=[];seen=set()
+    for item in journal.get('files',[]):
+        relative=Path(item['path'])
+        if relative.is_absolute() or '..' in relative.parts or str(relative) in seen:raise Stop('Invalid backup path')
+        seen.add(str(relative));target=_safe_file(root,root/relative);backup=_safe_file(backup_root,backup_root/relative)
+        original=backup.read_bytes()
+        if hashlib.sha256(original).hexdigest()!=item['before_sha256']:raise Stop('Backup checksum mismatch')
+        current=target.read_bytes();current_hash=hashlib.sha256(current).hexdigest()
+        if current_hash==item['before_sha256']:continue
+        if current_hash!=item['after_sha256']:raise Stop('PLAN_STALE: file changed since the recorded update; preserve both copies')
+        plans.append((target,current,original))
+    if not plans:return 0
+    lock=root/'.gamebridge-name.lock'
+    try:fd=os.open(lock,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)
+    except FileExistsError:raise Stop('Library is locked; inspect interrupted recovery before restoring') from None
+    os.close(fd);restore_root=backup_root/('restore-'+uuid.uuid4().hex);restore_root.mkdir()
+    try:
+        for index,(target,current,original) in enumerate(plans):
+            _safe_file(root,target)
+            if target.read_bytes()!=current:raise Stop('PLAN_STALE: file changed before restore')
+            retained=restore_root/str(index)
+            with retained.open('xb') as stream:stream.write(current);stream.flush();os.fsync(stream.fileno())
+            if retained.read_bytes()!=current:raise Stop('Restore preimage backup failed')
+        for target,current,original in plans:
+            _safe_file(root,target)
+            if target.read_bytes()!=current:raise Stop('PLAN_STALE: file changed during restore')
+            _atomic_bytes(target,original,stat.S_IMODE(target.stat().st_mode))
+            if target.read_bytes()!=original:raise Stop('Restore verification failed')
+        return len(plans)
+    finally:
+        if lock.exists():lock.unlink()
 
 
 def print_safety() -> None:
@@ -863,22 +951,27 @@ class Session:
 
 
 def initial_session(root_override: Optional[str], player_name_override: Optional[str]) -> Session:
-    root = Path(root_override).expanduser() if root_override else None
+    try:saved=preferences.load()
+    except (ValueError,OSError) as error:
+        saved={};warn(f"Saved preferences could not be loaded and were left untouched: {error}")
+    chosen_root=root_override or saved.get('root')
+    root=Path(chosen_root).expanduser() if chosen_root else None
     if root is None:
-        libs = discover_libraries()
-        root = libs[0] if libs else None
+        libs=discover_libraries();root=libs[0] if libs else None
+    manual=player_name_override or os.environ.get('GAMEBRIDGE_USERNAME') or os.environ.get('GAMEBRIDGE_PLAYER_NAME')
+    if manual:return Session(root,validate_player_name(manual.strip()),None,'manual override')
+    if saved.get('player_name'):
+        identity=next((row for row in detect_steam_identities() if row.steam_id==saved.get('steam_id')),None) if saved.get('steam_id') else None
+        return Session(root,saved['player_name'],identity,saved.get('source') or 'saved preference')
+    identity=detect_steam_username()
+    if identity:return Session(root,steam_login_name(identity),identity,'Steam AccountName · loginusers.vdf')
+    return Session(root,None,None,'not detected')
 
-    manual = (
-        player_name_override
-        or os.environ.get("GAMEBRIDGE_USERNAME")
-        or os.environ.get("GAMEBRIDGE_PLAYER_NAME")
-    )
-    if manual:
-        return Session(root, manual.strip(), None, "manual override")
-    ident = detect_steam_username()
-    if ident:
-        return Session(root, steam_login_name(ident), ident, "Steam AccountName · loginusers.vdf")
-    return Session(root, None, None, "not detected")
+
+def save_session(session: Session) -> None:
+    if session.player_name:validate_player_name(session.player_name)
+    preferences.save({'schema':1,'root':str(session.root) if session.root else None,'player_name':session.player_name,
+                      'source':session.player_name_source,'steam_id':session.identity.steam_id if session.identity else None})
 
 
 def describe_session(session: Session) -> None:
@@ -1026,8 +1119,10 @@ def settings_menu(session: Session) -> None:
         try:
             if choice == "1":
                 choose_profile_name(session)
+                save_session(session)
             elif choice == "2":
                 choose_library(session)
+                save_session(session)
             else:
                 warn("Unknown menu choice")
         except Stop as exc:
@@ -1098,6 +1193,7 @@ def cli_main(argv: Optional[list[str]] = None) -> int:
     action.add_argument("--audit", action="store_true", help="read-only inventory of recognized player-name settings")
     action.add_argument("--scan", action="store_true", help="scan and preview only")
     action.add_argument("--apply", action="store_true", help="scan, back up, update, and verify")
+    action.add_argument("--restore", metavar="BACKUP", help="restore a verified backup only if current files still match its applied version")
     p.add_argument("--root", help="game library root")
     p.add_argument("--player-name", "--username", dest="player_name", help="player name to use")
     p.add_argument("--yes", action="store_true", help="do not ask for apply confirmation")
@@ -1108,6 +1204,14 @@ def cli_main(argv: Optional[list[str]] = None) -> int:
     if args.no_color:
         USE_COLOR = False
 
+    if args.restore:
+        if not args.root:
+            fail("Restore requires the explicit original --root");return 2
+        if not args.yes and (not sys.stdin.isatty() or not confirm("Restore verified configuration backups?")):
+            fail("Restore was not confirmed; pass --yes only after reviewing the backup");return 2
+        try:
+            count=restore_changes(Path(args.root).expanduser(),Path(args.restore).expanduser());ok(f"Restored and verified {count} configuration files");return 0
+        except (Stop,OSError,ValueError) as error:fail(str(error));return 2
     if not (args.audit or args.scan or args.apply):
         return interactive_main(args.root, args.player_name)
 
@@ -1136,7 +1240,7 @@ def cli_main(argv: Optional[list[str]] = None) -> int:
     print_changes(root, changes, player_name)
     if args.scan or not changes:
         return 0
-    if not args.yes and sys.stdin.isatty() and not confirm(f"Fix {len(changes)} config(s) to use '{player_name}'?"):
+    if not args.yes and (not sys.stdin.isatty() or not confirm(f"Fix {len(changes)} config(s) to use '{player_name}'?")):
         warn("No files changed")
         return 0
     _, failed_count, _ = apply_changes(root, changes, player_name)

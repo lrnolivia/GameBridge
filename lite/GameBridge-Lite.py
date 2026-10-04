@@ -532,7 +532,7 @@ class GameBridgeLite(Gtk.Application):
     def _nothing_to_fix(self):
         self.set_busy(False)
         self.set_symbol("✓", "success-symbol")
-        self.set_phase("No player-name updates found", "phase-green", "All recognized player-name settings are already compatible.")
+        self.set_phase("No player-name updates found", "phase-green", "No supported default-name fields need changing. Custom, unreadable and unknown values remain protected.")
         self.progress.set_fraction(1.0)
         self.progress.set_text("No changes needed")
         return False
@@ -761,6 +761,11 @@ class GameBridgeLite(Gtk.Application):
 
         folder = self.folder_entry.get_text().strip()
         self.session.root = Path(folder).expanduser() if folder else None
+        try:
+            GB.save_session(self.session)
+        except (ValueError, OSError, GB.Stop) as error:
+            self._failed("Settings were not saved: " + str(error))
+            return
         self.refresh_session_labels()
         self.set_symbol("◇", "success-symbol")
         self.set_phase("Settings saved", "phase-green", "Ready to review games or fix recognized supported player-name values.")

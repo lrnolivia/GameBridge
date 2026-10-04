@@ -1,8 +1,8 @@
 # GameBridge agent bootstrap
 
 Universal execution authority:
-- `lrnolivia/loew-runner@main/LOEW_CHAT_BIBLE.md`
-- `lrnolivia/loew-runner@main/contracts/manifest.json`
+- `lrnolivia/relay@main/LOEW_CHAT_BIBLE.md`
+- `lrnolivia/relay@main/contracts/manifest.json`
 
 Read those before project work. This repository owns its project-specific product and implementation truth.
 
