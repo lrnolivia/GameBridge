@@ -2,9 +2,9 @@ name: GameBridge core safety
 on:
   push:
     branches: [gamebridge/full-scope-20261003]
-    paths: ['lite/**', 'tests/**', '.github/workflows/core-safety.yml']
+    paths: ['lite/**', 'src/**', 'tests/**', '.github/workflows/core-safety.yml']
   pull_request:
-    paths: ['lite/**', 'tests/**', '.github/workflows/core-safety.yml']
+    paths: ['lite/**', 'src/**', 'tests/**', '.github/workflows/core-safety.yml']
   workflow_dispatch:
 permissions:
   contents: read
@@ -19,5 +19,5 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: python -m compileall -q lite tests
+      - run: python -m compileall -q lite src tests
       - run: python -m unittest discover -s tests -v
