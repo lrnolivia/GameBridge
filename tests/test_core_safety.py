@@ -52,7 +52,7 @@ class SafetyTests(unittest.TestCase):
         self.file.write_text('new external data')
         with self.assertRaisesRegex(core.Stop,'PLAN_STALE'):core.restore_changes(self.root,backup)
         self.assertEqual(self.file.read_text(),'new external data')
-        self.file.write_text(change.updated_text);self.assertEqual(core.restore_changes(self.root,backup),1)
+        self.file.write_bytes(change.updated_text.encode('utf-8'));self.assertEqual(core.restore_changes(self.root,backup),1)
         self.assertEqual(self.file.read_text(),change.original_text);self.assertEqual(core.restore_changes(self.root,backup),0)
     def test_backup_corruption_refuses_restore(self):
         change=self.change();backup=self.base/'backup'
