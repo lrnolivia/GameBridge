@@ -81,6 +81,21 @@ def safe_relative(path):
     return '/'.join(parts)==path
 
 
+def _unlinked_directory_chain(path:Path):
+    """Reject observable links/junctions in every directory component.
+
+    This is read-only discovery hardening, not a lock or an atomic filesystem
+    snapshot. Any future apply still requires independent quiescence and
+    platform-specific race-safe write handling.
+    """
+    for directory in (*reversed(path.parents),path):
+        info=directory.lstat()
+        if stat.S_ISLNK(info.st_mode) or getattr(directory,'is_junction',lambda:False)():
+            raise ValueError('Linked directory ancestry requires an explicit real-root mapping: '+str(directory))
+        if not stat.S_ISDIR(info.st_mode):
+            raise ValueError('Directory changed during discovery: '+str(directory))
+
+
 def snapshot(root:Path,identity:Identity,*,initialized=False,max_files=MAX_FILES,max_bytes=MAX_BYTES):
     """Never interpret a missing/inaccessible path as an empty initialized save."""
     root=Path(root).absolute();files=[];total=0;seen=set()
@@ -88,8 +103,10 @@ def snapshot(root:Path,identity:Identity,*,initialized=False,max_files=MAX_FILES
         if root.is_symlink() or getattr(root,'is_junction',lambda:False)():raise ValueError('Linked endpoint root requires an explicit real-root mapping')
         if not root.exists():return Snapshot(identity,'missing',False,reason='Endpoint does not exist; initialization is unproven')
         if not root.is_dir():raise ValueError('Endpoint is not a directory')
+        _unlinked_directory_chain(root)
         def walk_error(error):raise error
         for folder,dirs,names in os.walk(root,followlinks=False,onerror=walk_error):
+            _unlinked_directory_chain(Path(folder))
             dirs.sort();names.sort()
             for name in dirs+names:
                 path=Path(folder)/name;rel=path.relative_to(root).as_posix()
@@ -105,6 +122,7 @@ def snapshot(root:Path,identity:Identity,*,initialized=False,max_files=MAX_FILES
                 if not stat.S_ISREG(info.st_mode) or info.st_nlink!=1:raise ValueError('Nonregular or hardlinked save is protected: '+rel)
                 total+=info.st_size
                 if len(files)>=max_files or total>max_bytes:raise ValueError('Endpoint exceeds bounded snapshot limits')
+                _unlinked_directory_chain(path.parent)
                 descriptor=os.open(path,os.O_RDONLY|getattr(os,'O_NOFOLLOW',0));digest=sha256();read=0
                 with os.fdopen(descriptor,'rb') as stream:
                     opened=os.fstat(stream.fileno())
@@ -114,6 +132,7 @@ def snapshot(root:Path,identity:Identity,*,initialized=False,max_files=MAX_FILES
                         if read>info.st_size or read>max_bytes:raise ValueError('File grew during snapshot')
                         digest.update(chunk)
                     after=os.fstat(stream.fileno())
+                _unlinked_directory_chain(path.parent)
                 final=path.lstat()
                 if read!=info.st_size or any(getattr(info,k)!=getattr(other,k) for other in (after,final) for k in ('st_dev','st_ino','st_size','st_mtime_ns')):raise ValueError('File changed during snapshot')
                 files.append(File(rel,digest.hexdigest(),read))
