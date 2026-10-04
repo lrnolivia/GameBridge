@@ -53,4 +53,37 @@ class SyncPlannerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             root=Path(folder);outside=root/'outside';outside.write_text('do not read');endpoint=root/'endpoint';endpoint.mkdir();(endpoint/'link').symlink_to(outside)
             self.assertEqual(snapshot(endpoint,self.left,initialized=True).state,'unavailable')
+
+    def test_ancestor_link_is_rejected_before_any_save_file_open(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);real=root/'real';endpoint=real/'saves'
+            endpoint.mkdir(parents=True);(endpoint/'slot.sav').write_text('outside alias')
+            alias=root/'alias'
+            try:alias.symlink_to(real,target_is_directory=True)
+            except OSError as error:self.skipTest('Directory symlink unavailable: '+str(error))
+            original_open=os.open
+            with patch('gamebridge.sync.os.open',wraps=original_open) as opened:
+                result=snapshot(alias/'saves',self.left,initialized=True)
+                self.assertEqual(result.state,'unavailable')
+                self.assertFalse(opened.called,'Aliased endpoint must be rejected before reading save bytes')
+
+    def test_directory_changed_to_link_during_walk_is_protected(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as folder:
+            base=Path(folder);root=base/'endpoint';root.mkdir();nested=root/'nested';nested.mkdir()
+            outside=base/'outside';outside.mkdir();(outside/'slot.sav').write_text('outside save')
+            probe=base/'probe'
+            try:probe.symlink_to(outside,target_is_directory=True);probe.unlink()
+            except OSError as error:self.skipTest('Directory symlink unavailable: '+str(error))
+            def changed_walk(*args,**kwargs):
+                yield str(root),['nested'],[]
+                nested.rmdir();nested.symlink_to(outside,target_is_directory=True)
+                yield str(nested),[],['slot.sav']
+            original_open=os.open
+            with patch('gamebridge.sync.os.walk',side_effect=changed_walk),patch('gamebridge.sync.os.open',wraps=original_open) as opened:
+                result=snapshot(root,self.left,initialized=True)
+                self.assertEqual(result.state,'unavailable')
+                self.assertFalse(opened.called,'Changed directory must be rejected before following it')
+
 if __name__=='__main__':unittest.main()
