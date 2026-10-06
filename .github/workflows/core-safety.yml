@@ -1,0 +1,23 @@
+name: GameBridge core safety
+on:
+  push:
+    branches: [gamebridge/full-scope-20261003]
+    paths: ['lite/**', 'src/**', 'tests/**', '.github/workflows/core-safety.yml']
+  pull_request:
+    paths: ['lite/**', 'src/**', 'tests/**', '.github/workflows/core-safety.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  safety:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m compileall -q lite src tests
+      - run: python -m unittest discover -s tests -v
